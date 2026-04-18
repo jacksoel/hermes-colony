@@ -509,6 +509,134 @@ class APIServerAdapter(BasePlatformAdapter):
     # Agent creation helper
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _resolve_provider_for_model_override(
+        model_name: str,
+        user_config: dict,
+        default_runtime: dict,
+    ) -> Optional[tuple]:
+        """Resolve provider credentials for a model override.
+
+        When a caller (e.g. Clicky) overrides the model, we need to find the
+        correct provider so the LLM call goes to the right endpoint.  Without
+        this, ``xai/grok-4.20-multi-agent-0309`` would be sent to ollama → 404.
+
+        Returns ``(corrected_model_name, runtime_kwargs)`` or ``None``.
+        The corrected model name strips any provider prefix that was used for
+        matching (e.g. ``xai/grok-4.20-...`` → ``grok-4.20-...`` when the
+        ``xai`` custom_provider entry uses ``model: grok-4.20-...``).
+
+        Resolution chain:
+          1. ``custom_providers`` in config.yaml — exact model match gives us
+             base_url, api_key (via key_env), api_mode.
+          2. ``detect_provider_for_model()`` — built-in provider catalogs
+             (xai, anthropic, openai, etc.) with credential check.
+          3. Return ``None`` — caller should keep default runtime and log a warning.
+        """
+        if not model_name:
+            return None
+
+        # --- Step 1: Check custom_providers for an exact model match ---
+        try:
+            from hermes_cli.config import get_compatible_custom_providers
+            custom_providers = get_compatible_custom_providers(user_config)
+        except Exception:
+            custom_providers = user_config.get("custom_providers")
+            if not isinstance(custom_providers, list):
+                custom_providers = []
+
+        for cp in custom_providers:
+            if not isinstance(cp, dict):
+                continue
+            cp_model = (cp.get("model") or "").strip()
+            cp_name = (cp.get("name") or "").strip()
+            if not cp_model:
+                continue
+            # Match exact, or with provider prefix (e.g. "xai/grok-4.20-..."
+            # matches a custom_provider with name="xai" model="grok-4.20-...").
+            # Also handle the reverse: model_name="grok-4.20-..." matches
+            # custom_provider model="grok-4.20-...".
+            model_lower = model_name.strip().lower()
+            cp_model_lower = cp_model.lower()
+            cp_name_lower = cp_name.lower()
+            # Build all valid forms of this custom provider entry
+            match_forms = {cp_model_lower}
+            if cp_name_lower:
+                match_forms.add(f"{cp_name_lower}/{cp_model_lower}")
+            # Also strip any "provider/" prefix from the requested model
+            stripped = model_lower
+            if "/" in model_lower:
+                stripped = model_lower.split("/", 1)[1]
+            if model_lower not in match_forms and stripped != cp_model_lower:
+                continue
+            # Found a matching custom provider entry
+            cp_base_url = (
+                cp.get("base_url") or cp.get("url") or cp.get("api") or ""
+            ).strip()
+            if not cp_base_url:
+                continue
+
+            # Resolve API key — prefer explicit key, then env var, then default
+            cp_api_key = (cp.get("api_key") or "").strip()
+            if not cp_api_key:
+                key_env = (cp.get("key_env") or "").strip()
+                if key_env:
+                    cp_api_key = os.getenv(key_env, "").strip()
+            if not cp_api_key:
+                # Inherit from default runtime (same provider may share keys)
+                cp_api_key = default_runtime.get("api_key", "")
+
+            from hermes_cli.providers import custom_provider_slug
+            runtime = dict(default_runtime)  # copy defaults
+            runtime["provider"] = custom_provider_slug(cp_name) if cp_name else default_runtime.get("provider", "custom")
+            runtime["base_url"] = cp_base_url
+            runtime["api_key"] = cp_api_key
+            runtime["api_mode"] = (cp.get("api_mode") or "chat_completions").strip()
+
+            # Use the canonical model name from the config entry — not the
+            # caller's prefixed form.  "xai/grok-4.20-..." → "grok-4.20-..."
+            # so the downstream API receives the model name it expects.
+            corrected_model = cp_model
+
+            logger.debug(
+                "Model override resolved via custom_providers: %s → %s on provider=%s base_url=%s",
+                model_name, corrected_model, runtime["provider"], cp_base_url,
+            )
+            return corrected_model, runtime
+
+        # --- Step 2: Try detect_provider_for_model for built-in providers ---
+        try:
+            from hermes_cli.models import detect_provider_for_model
+            current_provider = default_runtime.get("provider", "custom")
+            result = detect_provider_for_model(model_name, current_provider)
+            if result:
+                detected_provider, detected_model = result
+                # Resolve credentials for the detected provider
+                from hermes_cli.runtime_provider import resolve_runtime_provider
+                try:
+                    provider_runtime = resolve_runtime_provider(
+                        requested=detected_provider,
+                    )
+                    runtime = dict(default_runtime)
+                    for key in ("provider", "api_key", "base_url", "api_mode"):
+                        val = provider_runtime.get(key)
+                        if val:
+                            runtime[key] = val
+                    logger.debug(
+                        "Model override resolved via detect_provider: %s → provider=%s base_url=%s",
+                        model_name, runtime.get("provider"), runtime.get("base_url"),
+                    )
+                    return model_name, runtime
+                except Exception as exc:
+                    logger.debug(
+                        "Detected provider %s for model %s but credential resolution failed: %s",
+                        detected_provider, model_name, exc,
+                    )
+        except Exception as exc:
+            logger.debug("detect_provider_for_model failed for %s: %s", model_name, exc)
+
+        return None
+
     def _create_agent(
         self,
         ephemeral_system_prompt: Optional[str] = None,
@@ -517,6 +645,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
+        model_override: Optional[str] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -531,9 +660,39 @@ class APIServerAdapter(BasePlatformAdapter):
         from hermes_cli.tools_config import _get_platform_tools
 
         runtime_kwargs = _resolve_runtime_agent_kwargs()
-        model = _resolve_gateway_model()
+        # Allow callers (e.g. Clicky via DesktopActionServer) to override the
+        # model — this preserves the user's model selection as a front-end
+        # contract for downstream agent orchestration.
+        model = model_override if model_override else _resolve_gateway_model()
 
         user_config = _load_gateway_config()
+
+        if model_override:
+            # Resolve the correct provider for the override model so we don't
+            # blindly send e.g. "xai/grok-4.20-multi-agent-0309" to the
+            # default provider (ollama).  Searches custom_providers first
+            # (config.yaml entries with per-model base_url/api_key), then
+            # falls back to detect_provider_for_model() for built-in providers.
+            override_result = self._resolve_provider_for_model_override(
+                model_override, user_config, runtime_kwargs,
+            )
+            if override_result is not None:
+                model, runtime_kwargs = override_result
+                logger.info(
+                    "Model override: using %s on provider %s (gateway default was %s on %s)",
+                    model,
+                    runtime_kwargs.get("provider", "?"),
+                    _resolve_gateway_model(),
+                    _resolve_runtime_agent_kwargs().get("provider", "?"),
+                )
+            else:
+                logger.warning(
+                    "Model override: using %s but could not resolve a provider "
+                    "(will use default provider %s — may 404). Gateway default was %s",
+                    model_override,
+                    runtime_kwargs.get("provider", "?"),
+                    _resolve_gateway_model(),
+                )
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
 
         max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
@@ -592,24 +751,111 @@ class APIServerAdapter(BasePlatformAdapter):
         })
 
     async def _handle_models(self, request: "web.Request") -> "web.Response":
-        """GET /v1/models — return hermes-agent as an available model."""
+        """GET /v1/models — return all models Hermes can route to.
+
+        Enumerates custom_providers from config.yaml plus built-in provider
+        catalogs that have credentials.  Each model includes ``owned_by``
+        set to the provider name so frontends (e.g. Clicky) can group them.
+        The gateway's advertised name (e.g. ``herald``) is always first.
+        """
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
 
+        from gateway.run import _load_gateway_config, _resolve_gateway_model
+        user_config = _load_gateway_config()
+        now = int(time.time())
+
+        seen = set()
+        models_data = []
+
+        # 1. Gateway default alias (always first)
+        models_data.append({
+            "id": self._model_name,
+            "object": "model",
+            "created": now,
+            "owned_by": "hermes",
+            "permission": [],
+            "root": self._model_name,
+            "parent": None,
+        })
+        seen.add(self._model_name)
+
+        # Also add hermes-agent if it differs from the profile name
+        if "hermes-agent" not in seen:
+            models_data.append({
+                "id": "hermes-agent",
+                "object": "model",
+                "created": now,
+                "owned_by": "hermes",
+                "permission": [],
+                "root": "hermes-agent",
+                "parent": None,
+            })
+            seen.add("hermes-agent")
+
+        # 2. All models from custom_providers in config.yaml
+        try:
+            from hermes_cli.config import get_compatible_custom_providers
+            custom_providers = get_compatible_custom_providers(user_config)
+        except Exception:
+            custom_providers = user_config.get("custom_providers")
+            if not isinstance(custom_providers, list):
+                custom_providers = []
+
+        for cp in custom_providers:
+            if not isinstance(cp, dict):
+                continue
+            cp_model = (cp.get("model") or "").strip()
+            cp_name = (cp.get("name") or "").strip().lower()
+            if not cp_model or cp_model in seen:
+                continue
+            seen.add(cp_model)
+            models_data.append({
+                "id": cp_model,
+                "object": "model",
+                "created": now,
+                "owned_by": cp_name or "custom",
+                "permission": [],
+                "root": cp_model,
+                "parent": None,
+            })
+
+        # 3. Built-in provider models with credentials
+        try:
+            from hermes_cli.models import _PROVIDER_MODELS
+            from hermes_cli.auth import PROVIDER_REGISTRY
+            for pid, model_list in _PROVIDER_MODELS.items():
+                # Check if we have credentials
+                pconfig = PROVIDER_REGISTRY.get(pid)
+                if not pconfig:
+                    continue
+                has_creds = False
+                for env_var in pconfig.api_key_env_vars:
+                    if os.getenv(env_var, "").strip():
+                        has_creds = True
+                        break
+                if not has_creds:
+                    continue
+                for mid in model_list:
+                    if mid in seen:
+                        continue
+                    seen.add(mid)
+                    models_data.append({
+                        "id": mid,
+                        "object": "model",
+                        "created": now,
+                        "owned_by": pid,
+                        "permission": [],
+                        "root": mid,
+                        "parent": None,
+                    })
+        except Exception:
+            pass
+
         return web.json_response({
             "object": "list",
-            "data": [
-                {
-                    "id": self._model_name,
-                    "object": "model",
-                    "created": int(time.time()),
-                    "owned_by": "hermes",
-                    "permission": [],
-                    "root": self._model_name,
-                    "parent": None,
-                }
-            ],
+            "data": models_data,
         })
 
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
@@ -715,6 +961,13 @@ class APIServerAdapter(BasePlatformAdapter):
         model_name = body.get("model", self._model_name)
         created = int(time.time())
 
+        # If the caller specifies a model that differs from the server's
+        # advertised name, pass it as a model override so the agent uses
+        # the caller's choice (e.g. Clicky forwarding its selected model).
+        model_override = None
+        if model_name != self._model_name:
+            model_override = model_name
+
         if stream:
             import queue as _q
             _stream_q: _q.Queue = _q.Queue()
@@ -772,6 +1025,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 stream_delta_callback=_on_delta,
                 tool_progress_callback=_on_tool_progress,
                 agent_ref=agent_ref,
+                model_override=model_override,
             ))
 
             return await self._write_sse_chat_completion(
@@ -786,6 +1040,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation_history=history,
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
+                model_override=model_override,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -1992,6 +2247,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_start_callback=None,
         tool_complete_callback=None,
         agent_ref: Optional[list] = None,
+        model_override: Optional[str] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -2014,6 +2270,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_progress_callback=tool_progress_callback,
                 tool_start_callback=tool_start_callback,
                 tool_complete_callback=tool_complete_callback,
+                model_override=model_override,
             )
             if agent_ref is not None:
                 agent_ref[0] = agent
