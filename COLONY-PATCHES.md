@@ -4,7 +4,7 @@ This document tracks all Colony-specific patches applied on top of the
 upstream `NousResearch/hermes-agent` releases. Each patch is a separate
 commit on the `colony` branch.
 
-**Base version:** `v2026.4.16`
+**Base version:** `v2026.6.19` (0.17.0)
 **Branch strategy:** `main` mirrors upstream (fast-forward only), `colony`
 has all Colony patches (merge commits from upstream tags, never rebase).
 
@@ -67,9 +67,7 @@ from `config.yaml` and built-in provider registries.
 
 ### Re-application Checklist (for future upstream merges)
 
-- [ ] Verify `_create_agent` signature hasn't gained new required params
-- [ ] Check `_handle_models` hasn't been reworked upstream with its own model
-      enumeration (would supersede this patch)
-- [ ] Verify `_run_agent` (formerly `_run_agent_in_thread`) passthrough
-- [ ] Verify Responses API endpoint (`_handle_responses`) still exists and
-      hasn't been refactored into a separate module
+- [x] Verify `_create_agent` signature hasn't gained new required params (merged with `gateway_session_key`, `reasoning_config`)
+- [x] Check `_handle_models` hasn't been reworked upstream with its own model enumeration (colony enumeration retained)
+- [x] Verify `_run_agent` passthrough (`model_override` + upstream `gateway_session_key`)
+- [x] Verify Responses API endpoint (`_handle_responses`) still exists; `model_override` passthrough re-applied on 0.17.0 merge
